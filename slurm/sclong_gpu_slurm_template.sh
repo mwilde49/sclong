@@ -40,11 +40,21 @@ fi
 BATCH_SIZE=${1:-32}
 N_CELLS=${2:-all}
 OUTPUT_DIR=${3:-$SCRATCH_ROOT/sclong_results}
+GENE_MAPPING_VERSION=${4:-}    # empty -> pipeline reads gene_meta/mappings/CURRENT
+POOLING=${5:-full}             # full | measured-only
+NORMALIZATION=${6:-as-shipped} # as-shipped | cpm
 
 mkdir -p logs "$OUTPUT_DIR"
 
+MAPPING_FLAG=()
+if [ -n "$GENE_MAPPING_VERSION" ]; then
+    MAPPING_FLAG=(--gene-mapping-version "$GENE_MAPPING_VERSION")
+fi
+
 echo "====================================================================="
-echo "  scLong — Stage 1 (zero-shot batch integration) — batch_size=$BATCH_SIZE n_cells=$N_CELLS"
+echo "  scLong — Stage 1 (zero-shot batch integration)"
+echo "  batch_size=$BATCH_SIZE n_cells=$N_CELLS pooling=$POOLING normalization=$NORMALIZATION"
+echo "  gene_mapping_version=${GENE_MAPPING_VERSION:-<CURRENT pointer>}"
 echo "====================================================================="
 
 apptainer exec \
@@ -52,6 +62,7 @@ apptainer exec \
     --cleanenv \
     --env PYTHONNOUSERSITE=1 \
     --env MPLBACKEND=Agg \
+    --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     --bind $PROJECT_ROOT:$PROJECT_ROOT \
     --bind $SCRATCH_ROOT:$SCRATCH_ROOT \
     --bind $WORK_ROOT:$WORK_ROOT \
@@ -62,4 +73,7 @@ apptainer exec \
         --output-dir "$OUTPUT_DIR" \
         --batch-size "$BATCH_SIZE" \
         --n-cells "$N_CELLS" \
-        --progress-every 25
+        --progress-every 25 \
+        --pooling "$POOLING" \
+        --normalization "$NORMALIZATION" \
+        "${MAPPING_FLAG[@]}"

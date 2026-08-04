@@ -1,0 +1,44 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%labels
+    Version         1.0.0
+    Description     scLong single-cell foundation model — embedding/zero-shot batch integration pipeline
+    Maintainer      mwilde49
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        cmake \
+        pkg-config \
+        libhdf5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir --upgrade pip
+
+    # torch build validated locally against an RTX 5070 Ti (Blackwell, sm_120); its arch
+    # list (sm_75/80/86/90/100/120) also covers Juno's A30 (Ampere, sm_80) and H100
+    # (Hopper, sm_90) — one wheel set for local dev and cluster deployment.
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+        torch torchvision torchaudio
+
+    pip install --no-cache-dir \
+        einops local-attention torch_geometric scanpy anndata scikit-learn tqdm \
+        matplotlib networkx pandas requests seaborn scipy scib
+
+    # Upstream scLong repo (BaiDing1234/scLong) — no license file at clone time; pinned
+    # to the commit read directly at time of audit. See sclong/ROADMAP.md §1 for the
+    # licensing basis under which this is built (lab-confirmed permission, 2026-08-03).
+    git clone https://github.com/BaiDing1234/scLong.git /opt/scLong
+    cd /opt/scLong && git checkout 41b72021540918e4386c4f2264351d7a6cbeed99
+
+    pip cache purge
+
+%environment
+    export PYTHONNOUSERSITE=1
+    export MPLBACKEND=Agg
+    export PYTHONPATH=/opt/scLong:$PYTHONPATH
+
+%runscript
+    exec python "$@"

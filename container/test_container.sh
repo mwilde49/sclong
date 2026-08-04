@@ -14,6 +14,15 @@ if [[ ! -f "$SIF" ]]; then
     exit 1
 fi
 
+# WSL2 keeps its GPU driver libraries at /usr/lib/wsl/lib, a location Apptainer's --nv
+# auto-detection doesn't search — without this, nvidia-smi/torch.cuda inside the
+# container fail with "GPU access blocked by the operating system" even though the host
+# GPU works fine. No-op on Juno/native Linux, where this path doesn't exist.
+NV_EXTRA_ARGS=()
+if [[ -d /usr/lib/wsl/lib ]]; then
+    NV_EXTRA_ARGS=(--bind /usr/lib/wsl:/usr/lib/wsl --env LD_LIBRARY_PATH=/usr/lib/wsl/lib)
+fi
+
 echo "=== Import check ==="
 apptainer exec --cleanenv --env PYTHONNOUSERSITE=1 "$SIF" python -c "
 import torch, torch_geometric, scanpy, anndata, scib, einops, local_attention
@@ -34,7 +43,7 @@ apptainer exec --cleanenv --env PYTHONNOUSERSITE=1 \
 if [[ "${1:-}" == "--gpu" ]]; then
     echo ""
     echo "=== GPU architecture forward-pass smoke test (synthetic weights, no checkpoint needed) ==="
-    apptainer exec --nv --cleanenv --env PYTHONNOUSERSITE=1 \
+    apptainer exec --nv --cleanenv --env PYTHONNOUSERSITE=1 "${NV_EXTRA_ARGS[@]}" \
         --bind "$PIPELINE_DIR:/pipeline" \
         "$SIF" python /pipeline/smoke_test_architecture.py
 fi

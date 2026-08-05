@@ -5,12 +5,16 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --partition=a30
-#SBATCH --gres=gpu:nvidia_a30:1
-# For larger batch sizes / more VRAM, swap to:
-#   #SBATCH --partition=h100
-#   #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3:1
-# (same swap dconvatac-gpu documents — see DCONVATAC_HPC_GUIDE.md in hpc/)
+#SBATCH --partition=h200
+#SBATCH --gpus=1
+# CORRECTED 2026-08-04 (ROADMAP.md §14.6): this default was stale from before Juno
+# access was confirmed -- it pointed at partition=a30/gres=gpu:nvidia_a30:1, which this
+# project has never actually verified works (a30's 24GB VRAM is also a real OOM risk at
+# batch_size=48+, vs. H200's 141GB). Every real completed full-scale run (jobs
+# 315836, 316352, 316699) used partition=h200. Use `--gpus=1` (generic count-based
+# allocation), not a named --gres string -- we tried guessing the H200 gres name
+# (gpu:nvidia_h200:1) and it failed with "Requested node configuration is not
+# available"; --gpus=1 is confirmed working and sidesteps needing the exact string.
 
 module load apptainer
 

@@ -44,10 +44,11 @@ toggleable CLI options below, each independently validated to help:
       actually means.)
 
 None of the three alone closes the 0.826->0.956 gap; combine all three and re-run at
-full scale to see how much they close together. (Combined result reported back as
-ASW=0.8550 -- but as of this docstring, that run's own manifest/artifact has not been
-committed anywhere in this repo; treat it as reported-not-yet-verified until the Juno
-/scratch output or a saved *_ce.npy/*_obs.csv pair is located. See ROADMAP.md §14.)
+full scale to see how much they close together. CONFIRMED 2026-08-04 (see ROADMAP.md
+§14.0): baseline = SLURM job 315836 (h200, 1:29:24, ASW=0.82615364,
+/scratch/.../sclong_results/scLong_batch_cell_emb_mode_ce.npy); combined = SLURM job
+316352 (h200, 1:28:42, config=map-v2_hgnc_plus_biomart_synonyms_pool-measured-only_norm-cpm,
+ASW=0.8550, /scratch/.../sclong_results_v2/..._ce.npy). Both real, both full n=all runs.
 
 **2026-08-04, post-workflow update (see ROADMAP.md §14 for the full synthesis of a
 4-round, 23-agent adversarial research pass):** two reprioritizations worth knowing

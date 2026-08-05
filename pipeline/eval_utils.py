@@ -89,11 +89,22 @@ def eval_scib_metrics(
             print_sys(f"bio_conservation: PCA-reduced {embedding_key} ({emb.shape[1]}-dim) -> "
                        f"{cluster_rep} ({n_comps}-dim) for clustering only.")
 
+        # BUG FOUND AND FIXED 2026-08-04 (see ROADMAP.md §14.2, job 316672's identical-
+        # to-14-decimals NMI/ARI across 3 different embeddings): scib.metrics.
+        # cluster_optimal_resolution SKIPS re-clustering whenever f"{cluster_key}_{res}"
+        # already exists in adata.obs.columns (its own caching, meant for the normal
+        # case of one adata per run). Any caller that reuses ONE adata object across
+        # multiple evaluate()/eval_scib_metrics() calls (e.g. experiments/
+        # additive_pooling_test.py, comparing several pooling variants in one process)
+        # silently gets the FIRST call's stale clustering reused for every subsequent
+        # variant. force=True (documented in scib's own isolated_labels_f1 docstring
+        # example) makes both calls below always re-cluster on the actual current
+        # embedding, regardless of what a prior call on this same adata left behind.
         try:
             cluster_key = "leiden_biocons"
             scib.metrics.cluster_optimal_resolution(
                 adata, label_key=label_key, cluster_key=cluster_key,
-                use_rep=cluster_rep, verbose=False, return_all=False,
+                use_rep=cluster_rep, verbose=False, return_all=False, force=True,
             )
             results_dict["NMI_cluster/label"] = scib.metrics.nmi(adata, cluster_key, label_key)
             results_dict["ARI_cluster/label"] = scib.metrics.ari(adata, cluster_key, label_key)
@@ -104,6 +115,7 @@ def eval_scib_metrics(
         try:
             results_dict["isolated_label_F1"] = scib.metrics.isolated_labels_f1(
                 adata, label_key=label_key, batch_key=batch_key, embed=cluster_rep, verbose=False,
+                force=True,  # same stale-cache issue as above -- see comment on cluster_optimal_resolution
             )
         except Exception as e:
             print_sys(f"WARNING: isolated_labels_f1 failed ({type(e).__name__}: {e}) -- reporting without it.")

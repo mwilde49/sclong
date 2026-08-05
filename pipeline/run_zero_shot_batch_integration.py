@@ -44,7 +44,29 @@ toggleable CLI options below, each independently validated to help:
       actually means.)
 
 None of the three alone closes the 0.826->0.956 gap; combine all three and re-run at
-full scale to see how much they close together.
+full scale to see how much they close together. (Combined result reported back as
+ASW=0.8550 -- but as of this docstring, that run's own manifest/artifact has not been
+committed anywhere in this repo; treat it as reported-not-yet-verified until the Juno
+/scratch output or a saved *_ce.npy/*_obs.csv pair is located. See ROADMAP.md §14.)
+
+**2026-08-04, post-workflow update (see ROADMAP.md §14 for the full synthesis of a
+4-round, 23-agent adversarial research pass):** two reprioritizations worth knowing
+before spending more GPU time here:
+  1. The authors' own vendored zero-shot script (vendor/scLong/zero-shot-batch/
+     scLong_zero_shot.py) feeds adata.X into get_cell_emb() with NO renormalization
+     step at all, and this repo's pancreas_scib.h5ad is confirmed np.allclose-identical
+     to theirs -- i.e. --normalization as-shipped IS the verified-faithful reproduction
+     of the paper's actual protocol, and it already falls ~0.13 short of 0.9561. No
+     normalization variant (cpm, literal, or any new one) can be "the fix" for fidelity;
+     cpm's empirical gain is a score-maximizing choice, not a bug fix. Deprioritized.
+  2. --normalization literal is a mathematically proven near-exact duplicate of an
+     already-tested, already-worse configuration (0.8674) for any biologically
+     plausible input -- see experiments/sanity_gate_literal_norm.py. Don't spend a GPU
+     run confirming this; the CPU-only sanity gate already tells you what it will show.
+  3. Standing recommendation adopted into this pipeline (see --bio-conservation flag
+     and eval_utils.py): every ASW number from here forward is reported alongside
+     NMI/ARI/isolated-label-F1. A rising ASW with flat/falling bio-conservation should
+     be reported as possible homogenization, not progress.
 
 Expects, under --data-root (default /data — bind-mount your host data dir there):
   gene_meta/selected_gene2vec_27k.npy
@@ -114,6 +136,37 @@ def cpm_renormalize(counts):
     return x.astype(np.float32)
 
 
+def literal_renormalize(counts):
+    """Paper Methods, subsection "Collection and preprocessing of large-scale transcriptomics
+    pretraining data" (Bai et al., Nat Commun 2026, PMC12982784), quoted verbatim -- confirmed
+    directly against PMC by two independent fetches, not a paraphrase:
+    'If an expression value x was in raw count, we applied log1p normalization to it:
+    x <- log(x/10000 + 1). Next, we adjusted the normalized expression values by
+    magnifying or clipping them so that the maximum value in each cell's expression
+    vector was 10. If the maximum value in an expression vector exceeded 10, all values
+    greater than 10 were set to 10. If the maximum value was less than 10, each value in
+    the vector was scaled by dividing it by the maximum value and then multiplying by 10.'
+
+    This is a genuinely different, ASYMMETRIC two-branch transform from cpm_renormalize
+    above: no prior library-size step, and when max>10 only the values that exceed 10 are
+    clipped (mid-range values are left untouched) rather than the whole row being
+    proportionally shrunk. Never previously tested — see
+    sclong-hpc/experiments/experiment_renormalization.py for a near-miss prior attempt
+    that got the log(x/10000+1) part right but always proportionally rescaled to max=10
+    in both directions (missing the asymmetric clip branch entirely).
+    """
+    if sparse.issparse(counts):
+        counts = counts.toarray()
+    counts = counts.astype(np.float64)
+    x = np.log(counts / 10000.0 + 1.0)
+    row_max = x.max(axis=1, keepdims=True)
+    clipped = np.minimum(x, 10.0)
+    safe_max = np.where(row_max <= 0, 1.0, row_max)
+    magnified = x * (10.0 / safe_max)
+    x = np.where(row_max > 10.0, clipped, np.where(row_max < 10.0, magnified, x))
+    return x.astype(np.float32)
+
+
 def reindex_tensor_universal(tensor, index_positions, dim, filler="0", device="cpu"):
     """Unmodified from upstream — gene-panel reindexing logic, no bugs found here."""
     index_tensor = torch.tensor(index_positions, device=device)
@@ -152,10 +205,25 @@ def main():
                     help="'full' (default, matches original behavior): keep all 27,875 gene-vocabulary "
                          "positions in the final embedding. 'measured-only': drop positions never measured "
                          "by this dataset's gene panel. See module docstring for the validated effect size.")
-    p.add_argument("--normalization", choices=["as-shipped", "cpm"], default="as-shipped",
-                    help="'as-shipped' (default, matches original behavior): use adata.X directly. "
+    p.add_argument("--normalization", choices=["as-shipped", "cpm", "literal"], default="as-shipped",
+                    help="'as-shipped' (default, matches original behavior): use adata.X directly, "
+                         "i.e. released scLong_zero_shot.py's true zero-renormalization fidelity check. "
                          "'cpm': recompute from adata.layers['counts'] with standard library-size "
-                         "normalization + log1p + per-cell max-scale-to-10. See module docstring.")
+                         "normalization + log1p + per-cell max-scale-to-10 (empirically best so far). "
+                         "'literal': recompute from adata.layers['counts'] with the paper Methods' exact "
+                         "asymmetric formula (log(x/10000+1), then clip-if-max>10 / magnify-if-max<10, "
+                         "no library-size step). See module docstring.")
+    p.add_argument("--seed", type=int, default=42,
+                    help="random_state for sc.pp.subsample when --n-cells < total. Was previously "
+                         "unseeded (each subsampled run used different, unrecoverable cells) -- fixed "
+                         "2026-08-04 per the gap-closing workflow's reproducibility finding. Matches "
+                         "the lab-wide seed=42 convention (see CLAUDE.md).")
+    p.add_argument("--bio-conservation", dest="bio_conservation", action="store_true", default=True,
+                    help="Compute NMI/ARI/isolated-label-F1 alongside batch ASW (default: on). "
+                         "Standing policy per the gap-closing workflow's unanimous, cross-examination-"
+                         "surviving finding: batch ASW alone cannot tell real integration from "
+                         "homogenization. Use --no-bio-conservation only for a quick ASW-only smoke test.")
+    p.add_argument("--no-bio-conservation", dest="bio_conservation", action="store_false")
     args = p.parse_args()
     print_sys(f"config: gene_mapping_version={args.gene_mapping_version!r} pooling={args.pooling!r} "
                f"normalization={args.normalization!r}")
@@ -225,24 +293,37 @@ def main():
 
     n_cells = int(np.min((adata.n_obs, n_cells)))
     if adata.n_obs > n_cells:
-        print_sys(f"adata has {adata.n_obs} cells. Taking a subset of {n_cells}.")
-        sc.pp.subsample(adata, n_obs=n_cells, copy=False)
+        print_sys(f"adata has {adata.n_obs} cells. Taking a subset of {n_cells} (seed={args.seed}).")
+        sc.pp.subsample(adata, n_obs=n_cells, copy=False, random_state=args.seed)
 
-    if args.normalization == "cpm":
+    if args.normalization in ("cpm", "literal"):
         if "counts" not in adata.layers:
-            print_sys("MISSING: adata.layers['counts'] required for --normalization cpm")
+            print_sys(f"MISSING: adata.layers['counts'] required for --normalization {args.normalization}")
             sys.exit(1)
         row_max_before = (adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)).max(axis=1)
-        X_to_use = cpm_renormalize(adata.layers["counts"])
+        renorm_fn = cpm_renormalize if args.normalization == "cpm" else literal_renormalize
+        X_to_use = renorm_fn(adata.layers["counts"])
         row_max_after = X_to_use.max(axis=1)
-        print_sys(f"normalization=cpm: per-cell max before mean={row_max_before.mean():.2f} "
+        n_at_10 = int(np.sum(np.isclose(row_max_after, 10.0, atol=1e-3)))
+        print_sys(f"normalization={args.normalization}: per-cell max before mean={row_max_before.mean():.2f} "
                    f"std={row_max_before.std():.2f} -> after mean={row_max_after.mean():.4f} "
-                   f"std={row_max_after.std():.6f} (target: 10.0 / 0.0)")
+                   f"std={row_max_after.std():.6f} n_at_max10={n_at_10}/{len(row_max_after)} "
+                   f"({100*n_at_10/len(row_max_after):.1f}%) (target: 10.0 / 0.0)")
     else:
         X_to_use = adata.X
 
     input_genes = adata.var.index.tolist()
     input_genes = [symbol2ens.get(symbol, f"unknown{i}") for i, symbol in enumerate(input_genes)]
+    # KNOWN, FILED, LOW-PRIORITY BUG (found by the gap-closing workflow, 2026-08-04): when
+    # two dataset gene symbols resolve to the same Ensembl ID (15/19,093 genes on the
+    # pancreas dataset, e.g. old-placeholder-name/current-name pairs like C10orf113/NEBL),
+    # this dict comprehension keeps only the LAST column's index for that Ensembl ID --
+    # the earlier, also-correctly-mapped column's expression values are silently dropped
+    # from the reindexed tensor rather than combined. None of the 15 known collisions
+    # overlap this project's currently-tracked marker genes (see ROADMAP.md §14), so this
+    # is not blocking any current investigation, but it is a real correctness gap worth
+    # fixing properly (summing colliding columns' raw counts before normalization, not
+    # after) before it's relied on for a cell-type-mapping-sensitive analysis.
     input_mapping = {idx: i for i, idx in enumerate(input_genes)}
     input_gene_num = len(input_genes)
 
@@ -317,6 +398,7 @@ def main():
     res = evaluate(
         adata_=adata, batch_key="batch", label_key=["celltype"], embedding_key=embedding_key,
         res_path=str(out_dir / f"scLong_batch_cell_emb_mode__{config_tag}.csv"),
+        bio_conservation=args.bio_conservation,
     )
     print(f"PROGRESS stage=evaluate done elapsed={time.time()-t_stage:.0f}s", flush=True)
     print_sys(res)

@@ -168,6 +168,32 @@ def literal_renormalize(counts):
     return x.astype(np.float32)
 
 
+def cpm_norescale_renormalize(counts):
+    """ROADMAP.md §14.5 candidate C -- the one cell of the {library-size-normalize:
+    yes/no} x {final max-rescale-to-10: yes/no} 2x2 design nobody had tested. Identical
+    to cpm_renormalize above (library-size normalize to target_sum=10000, log1p) but
+    WITHOUT the final per-cell max-rescale-to-10 step. Motivation (see ROADMAP.md §14.5):
+    the live upstream README documents embed.py's input contract as just "log1p
+    normalized" -- no mention of a max-10 step -- making this arguably a MORE literal
+    reading of the model's actual expected input than either cpm_renormalize or
+    literal_renormalize. Countervailing risk, also noted in §14.5: without the final
+    rescale, per-cell max values land systematically below 10 (a maximally-dominant
+    single gene at 100% of a 10000-target-sum library gives log1p(10000)=9.21; realistic
+    dominant markers give ~6.9-8.0), undershooting the value range the model's
+    continuous-scalar token_emb was calibrated to during pretraining (which used
+    exactly-10-capped inputs). Genuinely untested prior to 2026-08-04 -- unlike
+    literal_renormalize, this is NOT provably equivalent to any already-tested variant.
+    """
+    if sparse.issparse(counts):
+        counts = counts.toarray()
+    counts = counts.astype(np.float64)
+    lib_size = counts.sum(axis=1, keepdims=True)
+    lib_size[lib_size == 0] = 1.0
+    counts = counts / lib_size * 10000.0
+    x = np.log1p(counts)
+    return x.astype(np.float32)
+
+
 def reindex_tensor_universal(tensor, index_positions, dim, filler="0", device="cpu"):
     """Unmodified from upstream — gene-panel reindexing logic, no bugs found here."""
     index_tensor = torch.tensor(index_positions, device=device)
@@ -206,14 +232,19 @@ def main():
                     help="'full' (default, matches original behavior): keep all 27,875 gene-vocabulary "
                          "positions in the final embedding. 'measured-only': drop positions never measured "
                          "by this dataset's gene panel. See module docstring for the validated effect size.")
-    p.add_argument("--normalization", choices=["as-shipped", "cpm", "literal"], default="as-shipped",
+    p.add_argument("--normalization", choices=["as-shipped", "cpm", "literal", "cpm-norescale"],
+                    default="as-shipped",
                     help="'as-shipped' (default, matches original behavior): use adata.X directly, "
                          "i.e. released scLong_zero_shot.py's true zero-renormalization fidelity check. "
                          "'cpm': recompute from adata.layers['counts'] with standard library-size "
                          "normalization + log1p + per-cell max-scale-to-10 (empirically best so far). "
                          "'literal': recompute from adata.layers['counts'] with the paper Methods' exact "
                          "asymmetric formula (log(x/10000+1), then clip-if-max>10 / magnify-if-max<10, "
-                         "no library-size step). See module docstring.")
+                         "no library-size step) -- proven mathematically near-identical to an already-"
+                         "tested, already-worse variant (0.8674); kept only as a CPU-only correctness "
+                         "gate, do not spend GPU time on it (see ROADMAP.md §14.5). "
+                         "'cpm-norescale': same as cpm but WITHOUT the final max-scale-to-10 step -- "
+                         "the one untested cell of the normalization 2x2 design (ROADMAP.md §14.5).")
     p.add_argument("--seed", type=int, default=42,
                     help="random_state for sc.pp.subsample when --n-cells < total. Was previously "
                          "unseeded (each subsampled run used different, unrecoverable cells) -- fixed "
@@ -297,12 +328,16 @@ def main():
         print_sys(f"adata has {adata.n_obs} cells. Taking a subset of {n_cells} (seed={args.seed}).")
         sc.pp.subsample(adata, n_obs=n_cells, copy=False, random_state=args.seed)
 
-    if args.normalization in ("cpm", "literal"):
+    if args.normalization in ("cpm", "literal", "cpm-norescale"):
         if "counts" not in adata.layers:
             print_sys(f"MISSING: adata.layers['counts'] required for --normalization {args.normalization}")
             sys.exit(1)
         row_max_before = (adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)).max(axis=1)
-        renorm_fn = cpm_renormalize if args.normalization == "cpm" else literal_renormalize
+        renorm_fn = {
+            "cpm": cpm_renormalize,
+            "literal": literal_renormalize,
+            "cpm-norescale": cpm_norescale_renormalize,
+        }[args.normalization]
         X_to_use = renorm_fn(adata.layers["counts"])
         row_max_after = X_to_use.max(axis=1)
         n_at_10 = int(np.sum(np.isclose(row_max_after, 10.0, atol=1e-3)))

@@ -69,6 +69,19 @@ before spending more GPU time here:
      NMI/ARI/isolated-label-F1. A rising ASW with flat/falling bio-conservation should
      be reported as possible homogenization, not progress.
 
+**2026-08-11 update (ROADMAP.md §16): a colleague's independently written and run
+notebook (sclong_completed.ipynb), on the exact same checkpoint this pipeline uses,
+scored ASW=0.9212 -- well above this pipeline's own prior ceiling of 0.8550. The
+mechanism is new relative to everything tested so far: --pooling reindex-to-dataset
+(below) implements it. Preliminary reading, pending this pipeline's own replication runs:
+the dominant lever is the reindex-back-to-dataset-gene-space step (filler='mean'), not
+the additive concat-then-sum formula alone (already tested here, in isolation, and
+refuted at small n -- see §14.2/§15 -- because it was never combined with this
+reindexing step). --normalization shipped-max10 ports their exact preprocessing for a
+faithful side-by-side; --normalization cpm remains this pipeline's own best-performing
+preprocessing lever and is worth recombining with the new pooling mode once the faithful
+replication is confirmed.
+
 Expects, under --data-root (default /data — bind-mount your host data dir there):
   gene_meta/selected_gene2vec_27k.npy
   gene_meta/gocont_4096_48m_pretrain_1b_mix.pkl
@@ -92,7 +105,6 @@ import argparse
 import pickle
 import sys
 import time
-from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -104,7 +116,12 @@ from tqdm import tqdm
 from performer_pytorch_cont.ding_models import DualEncoderSCFM  # from PYTHONPATH=/opt/scLong
 
 from eval_utils import evaluate, print_sys
-from get_cell_emb import attach_get_cell_emb
+from get_cell_emb import attach_get_cell_emb, get_cell_emb_eq11_reindexed
+# reindex_tensor_universal moved to its own module 2026-08-11 so get_cell_emb.py can use
+# filler='mean' without a circular import (get_cell_emb.py <- this module <- get_cell_emb.py).
+# Re-exported here (not just imported) so experiments/additive_pooling_test.py's existing
+# `from run_zero_shot_batch_integration import reindex_tensor_universal` keeps working.
+from reindex_utils import reindex_tensor_universal  # noqa: F401
 
 
 def resolve_gene_mapping_path(gene_meta, version):
@@ -194,25 +211,30 @@ def cpm_norescale_renormalize(counts):
     return x.astype(np.float32)
 
 
-def reindex_tensor_universal(tensor, index_positions, dim, filler="0", device="cpu"):
-    """Unmodified from upstream — gene-panel reindexing logic, no bugs found here."""
-    index_tensor = torch.tensor(index_positions, device=device)
-    tensor_shape = list(tensor.shape)
-    tensor_shape[dim] = len(index_positions)
-    index_shape = [1] * len(tensor_shape)
-    index_shape[dim] = len(index_positions)
-    index_tensor = index_tensor.view(*index_shape).expand(*tensor_shape)
+def shipped_max10_rescale(X):
+    """ROADMAP.md §16 -- the exact preprocessing step a colleague's independently run
+    notebook (sclong_completed.ipynb cell 9) applied on top of the shipped, already-
+    log1p'd .X (paper Methods, p.13, applied literally): rescale each cell so its own max
+    value is exactly 10 -- clip down if it exceeds 10, scale the whole row up if it's
+    under 10. That combination (as-shipped data + this rescale + the reindex-to-dataset
+    pooling below) scored ASW=0.9212 on the same checkpoint this pipeline uses.
 
-    if filler == "0":
-        padder_shape = deepcopy(tensor_shape)
-        padder_shape[dim] = 1
-        padder = torch.zeros(padder_shape, dtype=tensor.dtype, device=device)
-    elif filler == "mean":
-        padder = tensor.mean(dim=dim, keepdim=True)
-    else:
-        raise ValueError("filler should be 0 or mean!")
-    expanded_tensor = torch.cat((tensor, padder), dim=dim)
-    return torch.gather(expanded_tensor, dim, index_tensor)
+    Genuinely different from every other --normalization option here: 'as-shipped' does
+    nothing to X at all; 'cpm'/'literal'/'cpm-norescale' all discard the shipped .X
+    entirely and rebuild from adata.layers['counts']. This one starts from the shipped
+    .X (whatever normalization the authors' own file already carries) and only adds the
+    per-cell max-10 step on top -- no library-size renormalization, no work from raw
+    counts at all.
+    """
+    if sparse.issparse(X):
+        X = X.toarray()
+    X = np.asarray(X, dtype=np.float64)
+    row_max = X.max(axis=1, keepdims=True)
+    safe_max = np.where(row_max == 0, 1.0, row_max)
+    clipped = np.minimum(X, 10.0)
+    scaled = X * (10.0 / safe_max)
+    X = np.where(row_max > 10.0, clipped, np.where(row_max < 10.0, scaled, X))
+    return X.astype(np.float32)
 
 
 def main():
@@ -228,11 +250,20 @@ def main():
     p.add_argument("--gene-mapping-version", type=str, default=None,
                     help="Named version under gene_meta/mappings/. Defaults to gene_meta/mappings/CURRENT, "
                          "falling back to the legacy flat gene_meta/human_symbol_to_ens.txt if neither exists.")
-    p.add_argument("--pooling", choices=["full", "measured-only"], default="full",
+    p.add_argument("--pooling", choices=["full", "measured-only", "reindex-to-dataset"], default="full",
                     help="'full' (default, matches original behavior): keep all 27,875 gene-vocabulary "
                          "positions in the final embedding. 'measured-only': drop positions never measured "
-                         "by this dataset's gene panel. See module docstring for the validated effect size.")
-    p.add_argument("--normalization", choices=["as-shipped", "cpm", "literal", "cpm-norescale"],
+                         "by this dataset's gene panel. 'reindex-to-dataset' (ROADMAP.md §16, NEW "
+                         "2026-08-11): the paper's literal Equation (11) -- concatenate the reconstructed "
+                         "expression onto the contextualized representation, reindex the result back onto "
+                         "the DATASET's own gene ordering (filler=mean for genes the model's vocabulary "
+                         "doesn't cover), THEN sum-pool. Output dimensionality is the dataset's own gene "
+                         "count, not max_seq_len -- ignores --output-key (always uses merged_decodings, "
+                         "matching the paper). Ported from a colleague's independently run notebook that "
+                         "scored ASW=0.9212 on this exact checkpoint. See get_cell_emb.py for the "
+                         "implementation and module docstring above for the validated effect size.")
+    p.add_argument("--normalization",
+                    choices=["as-shipped", "cpm", "literal", "cpm-norescale", "shipped-max10"],
                     default="as-shipped",
                     help="'as-shipped' (default, matches original behavior): use adata.X directly, "
                          "i.e. released scLong_zero_shot.py's true zero-renormalization fidelity check. "
@@ -244,7 +275,12 @@ def main():
                          "tested, already-worse variant (0.8674); kept only as a CPU-only correctness "
                          "gate, do not spend GPU time on it (see ROADMAP.md §14.5). "
                          "'cpm-norescale': same as cpm but WITHOUT the final max-scale-to-10 step -- "
-                         "the one untested cell of the normalization 2x2 design (ROADMAP.md §14.5).")
+                         "the one untested cell of the normalization 2x2 design (ROADMAP.md §14.5). "
+                         "'shipped-max10' (ROADMAP.md §16, NEW 2026-08-11): do NOT touch "
+                         "adata.layers['counts'] at all -- take the shipped .X as-is and only apply the "
+                         "per-cell max-rescale-to-10 step on top. This is what the 0.9212 notebook run "
+                         "actually did; distinct from 'cpm' (which discards the shipped .X and rebuilds "
+                         "from raw counts with a library-size step first).")
     p.add_argument("--seed", type=int, default=42,
                     help="random_state for sc.pp.subsample when --n-cells < total. Was previously "
                          "unseeded (each subsampled run used different, unrecoverable cells) -- fixed "
@@ -328,7 +364,18 @@ def main():
         print_sys(f"adata has {adata.n_obs} cells. Taking a subset of {n_cells} (seed={args.seed}).")
         sc.pp.subsample(adata, n_obs=n_cells, copy=False, random_state=args.seed)
 
-    if args.normalization in ("cpm", "literal", "cpm-norescale"):
+    if args.normalization == "as-shipped":
+        X_to_use = adata.X
+    elif args.normalization == "shipped-max10":
+        row_max_before = (adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)).max(axis=1)
+        X_to_use = shipped_max10_rescale(adata.X)
+        row_max_after = X_to_use.max(axis=1)
+        n_at_10 = int(np.sum(np.isclose(row_max_after, 10.0, atol=1e-3)))
+        print_sys(f"normalization=shipped-max10: per-cell max before mean={row_max_before.mean():.2f} "
+                   f"std={row_max_before.std():.2f} -> after mean={row_max_after.mean():.4f} "
+                   f"std={row_max_after.std():.6f} n_at_max10={n_at_10}/{len(row_max_after)} "
+                   f"({100*n_at_10/len(row_max_after):.1f}%) (target: 10.0 / 0.0)")
+    else:  # cpm, literal, cpm-norescale
         if "counts" not in adata.layers:
             print_sys(f"MISSING: adata.layers['counts'] required for --normalization {args.normalization}")
             sys.exit(1)
@@ -345,8 +392,6 @@ def main():
                    f"std={row_max_before.std():.2f} -> after mean={row_max_after.mean():.4f} "
                    f"std={row_max_after.std():.6f} n_at_max10={n_at_10}/{len(row_max_after)} "
                    f"({100*n_at_10/len(row_max_after):.1f}%) (target: 10.0 / 0.0)")
-    else:
-        X_to_use = adata.X
 
     input_genes = adata.var.index.tolist()
     input_genes = [symbol2ens.get(symbol, f"unknown{i}") for i, symbol in enumerate(input_genes)]
@@ -384,6 +429,21 @@ def main():
         print_sys(f"pooling=measured-only: {n_measured} / {len(scfm_genes_pad)} "
                    f"({100 * n_measured / len(scfm_genes_pad):.1f}%) positions kept")
 
+    # --pooling reindex-to-dataset (ROADMAP.md §16): the OPPOSITE-direction mapping from
+    # scfm_index_positions above -- for each of the dataset's own N genes (in the
+    # dataset's own column order), which position in the model's vocabulary holds its
+    # data (or scfm_seq_len, i.e. "none", if the model's vocabulary doesn't cover it).
+    # Reuses scfm_mapping, already built above for scfm_index_positions -- this is the
+    # only new work needed to support the new pooling mode.
+    input_index_positions = None
+    if args.pooling == "reindex-to-dataset":
+        input_index_positions = [scfm_mapping.get(idx, scfm_seq_len) for idx in input_genes]
+        n_covered = sum(1 for pos in input_index_positions if pos != scfm_seq_len)
+        print_sys(f"pooling=reindex-to-dataset: {n_covered} / {input_gene_num} "
+                   f"({100 * n_covered / input_gene_num:.1f}%) dataset genes have a real "
+                   f"model position (rest mean-imputed); output dim = {input_gene_num} "
+                   f"(dataset gene count, not max_seq_len)")
+
     cell_embeddings = []
     embedding_key = "X_scLong"
     batch_starts = list(range(0, n_cells, args.batch_size))
@@ -398,9 +458,12 @@ def main():
                 x_batch = x_batch.toarray()
             x = torch.tensor(x_batch).to(torch.float32).to(device)
             x_scfm = reindex_tensor_universal(x, scfm_index_positions, dim=1, filler="0", device=device)
-            cell_emb = model.get_cell_emb(x_scfm, output_key=args.output_key)
-            if measured_mask is not None:
-                cell_emb = cell_emb[:, measured_mask]
+            if args.pooling == "reindex-to-dataset":
+                cell_emb = get_cell_emb_eq11_reindexed(model, x_scfm, input_index_positions, device=device)
+            else:
+                cell_emb = model.get_cell_emb(x_scfm, output_key=args.output_key)
+                if measured_mask is not None:
+                    cell_emb = cell_emb[:, measured_mask]
             cell_embeddings.append(cell_emb.cpu().numpy())
 
         if (b_idx + 1) % args.progress_every == 0 or (b_idx + 1) == n_batches:
